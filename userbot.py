@@ -765,7 +765,7 @@ async def handler(event):
 async def main():
     await bot.start()
     me = await bot.get_me()
-    print(f"POMA запущена: {me.first_name} (@{me.username})")
+    print(f"rio запущена: {me.first_name} (@{me.username})")
     print("Команды: .помощь")
     await bot.run_until_disconnected()
 
