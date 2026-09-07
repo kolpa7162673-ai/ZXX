@@ -35,8 +35,8 @@ async def reminders_loop(bot):
         await asyncio.sleep(30)
 
 
-async def daily_digest_loop(bot, build_digest_fn):
-    """Раз в сутки, в DIGEST_HOUR_UTC, шлёт себе дайджест."""
+async def daily_digest_loop(bot, build_digest_fn, log_chat_id):
+    """Раз в сутки, в DIGEST_HOUR_UTC, шлёт дайджест в группу логов."""
     last_sent_day = None
     while True:
         try:
@@ -45,7 +45,7 @@ async def daily_digest_loop(bot, build_digest_fn):
             if now.tm_hour == DIGEST_HOUR_UTC and last_sent_day != today:
                 text = await build_digest_fn()
                 if text:
-                    await bot.send_message("me", text)
+                    await bot.send_message(log_chat_id, text)
                 storage.prune_digest_events(older_than_days=7)
                 last_sent_day = today
         except Exception as e:
@@ -53,7 +53,7 @@ async def daily_digest_loop(bot, build_digest_fn):
         await asyncio.sleep(300)  # проверка раз в 5 минут достаточно
 
 
-async def rss_loop(bot):
+async def rss_loop(bot, log_chat_id):
     """Раз в RSS_POLL_INTERVAL секунд проверяет добавленные RSS-ленты."""
     while True:
         try:
@@ -77,7 +77,7 @@ async def rss_loop(bot):
                     if guid and guid != feed["last_guid"]:
                         title = title_el.text if title_el is not None else "Новая запись"
                         link = link_el.text if link_el is not None else ""
-                        await bot.send_message("me", f"📰 {title}\n{link}")
+                        await bot.send_message(log_chat_id, f"📰 {title}\n{link}")
                         storage.update_feed_guid(feed["url"], guid)
                 except Exception as e:
                     print(f"[rss_loop] ошибка ленты {feed['url']}: {e}")
@@ -86,14 +86,14 @@ async def rss_loop(bot):
         await asyncio.sleep(RSS_POLL_INTERVAL)
 
 
-async def backup_loop(bot):
-    """Раз в сутки шлёт файл БД себе в Избранное как бэкап."""
+async def backup_loop(bot, log_chat_id):
+    """Раз в сутки шлёт файл БД в группу логов как бэкап."""
     while True:
         try:
             await asyncio.sleep(BACKUP_INTERVAL)
             if os.path.exists(storage.DB_PATH):
                 await bot.send_file(
-                    "me",
+                    log_chat_id,
                     storage.DB_PATH,
                     caption=f"🗄 Автобэкап БД POMA — {time.strftime('%Y-%m-%d %H:%M UTC')}",
                 )
@@ -101,13 +101,13 @@ async def backup_loop(bot):
             print(f"[backup_loop] ошибка: {e}")
 
 
-async def healthcheck_loop(bot):
-    """Раз в HEALTHCHECK_INTERVAL секунд шлёт короткий статус себе."""
+async def healthcheck_loop(bot, log_chat_id):
+    """Раз в HEALTHCHECK_INTERVAL секунд шлёт короткий статус в группу логов."""
     while True:
         try:
             await asyncio.sleep(HEALTHCHECK_INTERVAL)
             await bot.send_message(
-                "me",
+                log_chat_id,
                 f"✅ POMA жива — {time.strftime('%Y-%m-%d %H:%M UTC')}",
             )
         except Exception as e:
