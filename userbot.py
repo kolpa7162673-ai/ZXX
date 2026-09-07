@@ -6,9 +6,10 @@ import asyncio
 import aiohttp
 import dateparser
 from openai import OpenAI
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageService
+from telethon.tl.functions.channels import CreateChannelRequest
 from dotenv import load_dotenv
 
 import storage
@@ -37,12 +38,17 @@ conversations = {}
 MAX_HISTORY = 12
 ai_reply_ids = set()
 
+# ---------------- runtime state (не персистентное, живёт в памяти процесса) ----------------
 AFK_MODE = storage.get_setting("afk_enabled", "0") == "1"
 AFK_TEXT = storage.get_setting("afk_text", "Сейчас недоступен, отвечу позже.")
-_afk_recent_replies = {}
-_edit_throttle_lock = asyncio.Semaphore(3)
+_afk_recent_replies = {}  # user_id -> timestamp последнего автоответа (антиспам одному человеку)
+_edit_throttle_lock = asyncio.Semaphore(3)  # ограничение параллельных msg.edit() (антифлуд-бан)
 SAVES_DIR = "saved_media"
 os.makedirs(SAVES_DIR, exist_ok=True)
+
+# ---------------- лог-группа (создаётся автоматически) ----------------
+LOG_LEVEL = int(os.getenv("LOG_LEVEL", "1"))  # 0 = не логировать вообще
+LOG_CHAT_ID = None  # заполняется в ensure_log_chat() при старте
 
 
 # ===================== ИИ =====================
@@ -109,6 +115,7 @@ async def thinking_animation(event):
 
 
 async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: float = 0.06):
+    """Дописывает текст в уже существующее сообщение (эффект печати)."""
     full_text = full_text or ""
     if not full_text.strip():
         try:
@@ -118,6 +125,7 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
         track_ai_msg(msg)
         return msg
 
+    # короткое — сразу
     if len(full_text) <= 60:
         try:
             await msg.edit(full_text)
@@ -126,6 +134,7 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
         track_ai_msg(msg)
         return msg
 
+    # для кода — чуть крупнее куски (быстрее и меньше flood)
     if "```" in full_text or "def " in full_text or "function " in full_text:
         chunk_size = max(chunk_size, 48)
         delay = min(delay, 0.05)
@@ -152,6 +161,11 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
 
 
 async def ask_ai_animated(event, prompt: str, chat_id: int = None, system: str = None, typewriter: bool = True):
+    """
+    1) анимация прогресса
+    2) запрос к ИИ
+    3) печать ответа в то же сообщение
+    """
     msg = await thinking_animation(event)
     answer = await ask_ai(prompt, chat_id=chat_id, system=system)
 
@@ -181,6 +195,8 @@ async def get_prompt(event, prefix: str) -> str:
 
 
 async def build_digest() -> str:
+    """Собирает дайджест: события слежки за ключевыми словами за последние 24 часа
+    + список активных напоминаний + количество открытых задач."""
     since = int(time.time()) - 86400
     events_ = storage.pull_digest_events(since)
     parts = []
@@ -204,6 +220,55 @@ async def build_digest() -> str:
     return "📊 **Дайджест дня**\n\n" + "\n\n".join(parts)
 
 
+async def ensure_log_chat():
+    """Проверяет сохранённый в БД чат для логов; если его нет (первый запуск
+    или чат стал недоступен) — создаёт новую супергруппу «POMA Logs» только с
+    самим собой и запоминает её id, чтобы использовать при следующих запусках."""
+    global LOG_CHAT_ID
+    saved_id = storage.get_setting("log_chat_id")
+    if saved_id:
+        try:
+            entity = await bot.get_entity(int(saved_id))
+            LOG_CHAT_ID = int(saved_id)
+            return entity
+        except Exception:
+            pass  # чат удалён/недоступен — создадим новый ниже
+
+    result = await bot(CreateChannelRequest(
+        title="POMA Logs",
+        about="Автосозданный чат для логов и уведомлений POMA (антиудаление, RSS, дайджест, бэкапы)",
+        megagroup=True,
+    ))
+    new_chat = result.chats[0]
+    marked_id = utils.get_peer_id(new_chat)
+    storage.set_setting("log_chat_id", str(marked_id))
+    LOG_CHAT_ID = marked_id
+    return new_chat
+
+
+async def _send_log(text: str = None, file: str = None, caption: str = None):
+    try:
+        if LOG_CHAT_ID is None:
+            await ensure_log_chat()
+        if file:
+            await bot.send_file(LOG_CHAT_ID, file, caption=caption or text or "")
+        else:
+            await bot.send_message(LOG_CHAT_ID, text)
+    except Exception as e:
+        print(f"[log] не удалось отправить: {e}")
+
+
+async def _log(text: str = None, level: int = 1, file: str = None, caption: str = None):
+    """Логирование в группу POMA Logs. level: чем выше, тем менее важное
+    сообщение — если LOG_LEVEL меньше level, сообщение пропускается."""
+    if LOG_LEVEL < level:
+        return
+    try:
+        asyncio.create_task(_send_log(text=text, file=file, caption=caption))
+    except Exception:
+        pass
+
+
 async def send_animal(event, api_url: str, ok_caption: str, fail_text: str):
     try:
         async with aiohttp.ClientSession() as session:
@@ -224,7 +289,11 @@ async def send_animal(event, api_url: str, ok_caption: str, fail_text: str):
 
 @bot.on(events.NewMessage())
 async def _track_for_antidelete(event):
+    """Запоминаем сообщения только из личных чатов (не групп/каналов) —
+    антиудаление/антиредактирование работает только в личке."""
     try:
+        if not event.is_private:
+            return
         if storage.is_no_log(event.chat_id):
             return
         text = event.raw_text or ""
@@ -237,6 +306,8 @@ async def _track_for_antidelete(event):
 @bot.on(events.MessageEdited())
 async def _on_edit(event):
     try:
+        if not event.is_private:
+            return
         if storage.is_no_log(event.chat_id):
             return
         old = storage.get_tracked_message(event.id, event.chat_id)
@@ -244,10 +315,10 @@ async def _on_edit(event):
         if old and old["text"] and old["text"] != new_text:
             chat = await event.get_chat()
             chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", "чат")
-            await bot.send_message(
-                "me",
+            await _log(
                 f"✏️ **Сообщение отредактировано** в «{chat_name}»\n\n"
                 f"Было:\n{old['text']}\n\nСтало:\n{new_text}",
+                level=1,
             )
         storage.track_message(event.id, event.chat_id, event.sender_id, new_text, bool(event.message.media))
     except Exception as e:
@@ -256,27 +327,38 @@ async def _on_edit(event):
 
 @bot.on(events.MessageDeleted())
 async def _on_delete(event):
+    """Важно: Telegram для приватных чатов и обычных (не супергрупп) групп
+    НЕ передаёт chat_id в событии удаления — это ограничение самого API,
+    а не наше. Поэтому если chat_id есть — это супергруппа/канал, и мы её
+    сознательно игнорируем (антиудаление только для личных чатов).
+    Если chat_id отсутствует — ищем совпадение по msg_id среди сообщений,
+    которые мы уже трекали (а трекаем теперь только личку)."""
     try:
         for msg_id in event.deleted_ids:
-            chat_id = event.chat_id
-            if chat_id is None or storage.is_no_log(chat_id):
+            if event.chat_id is not None:
+                continue  # это супергруппа/канал — не личка, пропускаем
+
+            old = storage.find_tracked_message_by_id(msg_id)
+            if not old:
                 continue
-            old = storage.get_tracked_message(msg_id, chat_id)
-            if old and (old["text"] or old["has_media"]):
-                try:
-                    chat = await bot.get_entity(chat_id)
-                    chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", "чат")
-                except Exception:
-                    chat_name = str(chat_id)
-                body = old["text"] or "(медиа без текста)"
-                await bot.send_message(
-                    "me", f"🗑 **Сообщение удалено** в «{chat_name}»\n\n{body}"
-                )
+            if storage.is_no_log(old["chat_id"]):
+                continue
+            if not (old["text"] or old["has_media"]):
+                continue
+
+            try:
+                chat = await bot.get_entity(old["chat_id"])
+                chat_name = getattr(chat, "first_name", None) or str(old["chat_id"])
+            except Exception:
+                chat_name = str(old["chat_id"])
+
+            body = old["text"] or "(медиа без текста)"
+            await _log(f"🗑 **Сообщение удалено** в личке с «{chat_name}»\n\n{body}", level=1)
     except Exception as e:
         print(f"[antidelete] ошибка: {e}")
 
 
-# ===================== ВХОДЯЩИЕ: АФК / МОНИТОРИНГ / АКТИВНОСТЬ =====================
+# ===================== ВХОДЯЩИЕ: АФК / МОНИТОРИНГ КЛЮЧЕВЫХ СЛОВ / АКТИВНОСТЬ =====================
 
 @bot.on(events.NewMessage(incoming=True))
 async def _incoming_handler(event):
@@ -286,6 +368,7 @@ async def _incoming_handler(event):
         sender_id = event.sender_id
         text = event.raw_text or ""
 
+        # игнор-лист: полностью пропускаем чат, если не найдено исключение по важности
         ignored = storage.is_ignored(chat_id)
         important = False
         if ignored:
@@ -297,12 +380,14 @@ async def _incoming_handler(event):
                 )
                 important = "да" in (check or "").lower()[:10]
             if not important:
-                return
+                return  # чат в игноре и ничего важного — молча выходим
 
+        # трекинг активности для .актив/.молчуны (только группы/каналы, не личка)
         if event.is_group or event.is_channel:
             day = time.strftime("%Y-%m-%d", time.gmtime())
             storage.bump_activity(chat_id, sender_id, day)
 
+        # мониторинг ключевых слов
         if text:
             watches = storage.list_watches()
             lower_text = text.lower()
@@ -314,14 +399,13 @@ async def _incoming_handler(event):
                         chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", "чат")
                     except Exception:
                         chat_name = str(chat_id)
-                    await bot.send_message(
-                        "me", f"🔔 Слово «{kw}» упомянуто в «{chat_name}»:\n{text}"
-                    )
+                    await _log(f"🔔 Слово «{kw}» упомянуто в «{chat_name}»:\n{text}", level=1)
                     break
 
+        # АФК-автоответчик
         if AFK_MODE and event.is_private and not event.out:
             last = _afk_recent_replies.get(sender_id, 0)
-            if time.time() - last < 600:
+            if time.time() - last < 600:  # не спамим одному человеку чаще раза в 10 минут
                 return
             urgency = "не срочно"
             if text:
@@ -340,9 +424,7 @@ async def _incoming_handler(event):
                     name = getattr(sender, "first_name", "Кто-то")
                 except Exception:
                     name = "Кто-то"
-                await bot.send_message(
-                    "me", f"⚡ Похоже на срочное сообщение от {name}:\n{text}"
-                )
+                await _log(f"⚡ Похоже на срочное сообщение от {name}:\n{text}", level=1)
             await event.reply(reply_text)
             _afk_recent_replies[sender_id] = time.time()
     except Exception as e:
@@ -360,6 +442,7 @@ async def handler(event):
     lower = text.lower()
     chat_id = event.chat_id
 
+    # ---------- ОСНОВНОЕ ----------
     if lower.startswith(".расскажи"):
         prompt = await get_prompt(event, ".расскажи") or "Расскажи что-нибудь интересное и короткое"
         await ask_ai_animated(event, prompt, chat_id=chat_id)
@@ -423,6 +506,7 @@ async def handler(event):
         )
         return
 
+    # ---------- СТИЛЬ / КОНТЕНТ ----------
     if lower.startswith(".роль"):
         rest = text[5:].strip()
         if not rest:
@@ -608,6 +692,7 @@ async def handler(event):
         )
         return
 
+    # ---------- УЧЁБА / РАБОТА ----------
     if lower.startswith(".todo"):
         prompt = await get_prompt(event, ".todo")
         if not prompt:
@@ -661,6 +746,7 @@ async def handler(event):
         )
         return
 
+    # ---------- КОД ----------
     if lower.startswith(".bug") or lower.startswith(".ошибка"):
         pref = ".bug" if lower.startswith(".bug") else ".ошибка"
         prompt = await get_prompt(event, pref)
@@ -743,6 +829,7 @@ async def handler(event):
         )
         return
 
+    # ---------- NFT / WEB3 ----------
     if lower.startswith(".nft"):
         topic = await get_prompt(event, ".nft") or "идея NFT-коллекции"
         await ask_ai_animated(
@@ -804,6 +891,7 @@ async def handler(event):
         )
         return
 
+    # ---------- УТИЛИТЫ ----------
     if lower.startswith(".рандом") or lower.startswith(".random"):
         rest = text.split(maxsplit=1)
         if len(rest) < 2 or "-" not in rest[1]:
@@ -885,6 +973,7 @@ async def handler(event):
         await event.reply("Память диалога очищена 🧹")
         return
 
+    # ---------- ГОЛОС ----------
     if lower.startswith(".распознай"):
         if not event.is_reply:
             await event.reply("Ответь этой командой на голосовое/аудио сообщение")
@@ -907,6 +996,7 @@ async def handler(event):
             await status.edit(f"Не удалось распознать: {e}")
         return
 
+    # ---------- АФК ----------
     if lower.startswith(".афк"):
         global AFK_MODE, AFK_TEXT
         rest = text[4:].strip()
@@ -926,6 +1016,7 @@ async def handler(event):
             await event.reply("Использование: `.афк вкл [текст]` или `.афк выкл`")
         return
 
+    # ---------- ЗАМЕТКИ ----------
     if lower.startswith(".заметка"):
         note_text = await get_prompt(event, ".заметка")
         if not note_text:
@@ -953,6 +1044,7 @@ async def handler(event):
         await event.reply("Удалено ✅" if ok else "Заметка с таким id не найдена")
         return
 
+    # ---------- ЗАДАЧИ (реальный трекер, отдельно от ИИ-.todo) ----------
     if lower.startswith(".задача"):
         task_text = await get_prompt(event, ".задача")
         if not task_text:
@@ -980,6 +1072,7 @@ async def handler(event):
         await event.reply("Готово ✅" if ok else "Задача с таким id не найдена")
         return
 
+    # ---------- КОНТАКТЫ (CRM) ----------
     if lower.startswith(".контакт "):
         parts = text.split(maxsplit=2)
         if len(parts) < 3 or not parts[1].startswith("@"):
@@ -1012,8 +1105,10 @@ async def handler(event):
         await event.reply("📇 **Контакты**\n\n" + "\n".join(lines))
         return
 
+    # ---------- НАПОМИНАНИЯ ----------
     if lower.startswith(".напомни"):
         rest = text[8:].strip()
+        # ожидаем формат: "<когда> <текст>", когда парсим по первому разумному куску
         parsed_dt = None
         remind_text = rest
         for cut in range(len(rest), 0, -1):
@@ -1062,6 +1157,7 @@ async def handler(event):
         await event.reply("Отменено ✅" if ok else "Не найдено")
         return
 
+    # ---------- СОХРАНЕНИЕ МЕДИА ----------
     if lower == ".сохрани":
         if not event.is_reply:
             await event.reply("Ответь этой командой на фото/видео/документ")
@@ -1077,6 +1173,7 @@ async def handler(event):
             await event.reply(f"Не удалось сохранить: {e}")
         return
 
+    # ---------- СУММАРИЗАЦИЯ ССЫЛКИ ----------
     if lower.startswith(".суммаризируй"):
         url = text.split(maxsplit=1)
         if len(url) < 2 or not url[1].strip().startswith("http"):
@@ -1100,6 +1197,7 @@ async def handler(event):
             await status.edit(f"Не удалось обработать ссылку: {e}")
         return
 
+    # ---------- СЛЕЖКА ЗА КЛЮЧЕВЫМИ СЛОВАМИ ----------
     if lower.startswith(".следи"):
         kw = text[6:].strip()
         if not kw:
@@ -1126,18 +1224,27 @@ async def handler(event):
         await event.reply("👁 **Слежка за словами**\n\n" + ", ".join(watches))
         return
 
+    # ---------- ДАЙДЖЕСТ ПО ЗАПРОСУ ----------
     if lower == ".сводка":
         status = await event.reply("📊 Собираю сводку...")
         digest_text = await build_digest()
         await status.edit(digest_text or "За последнее время значимых событий не было")
         return
 
+    # ---------- ОТЛОЖЕННАЯ ОТПРАВКА ----------
     if lower.startswith(".отложи"):
         rest = text[7:].strip()
-        tokens = rest.split()
+        parts = rest.split(maxsplit=2)
+        if len(parts) < 3:
+            await event.reply("`.отложи <когда> @получатель текст`")
+            return
+        when_str, target, msg_text = parts[0], parts[1], parts[2]
+        # время может состоять из пары слов ("через", "2", "часа") — пробуем по нарастающей
+        combined = rest
         parsed_dt = None
         target_str = None
         body = None
+        tokens = rest.split()
         for i in range(1, len(tokens)):
             maybe_time = " ".join(tokens[:i])
             dt = dateparser.parse(
@@ -1169,8 +1276,10 @@ async def handler(event):
         )
         return
 
+    # ---------- АКТИВНОСТЬ ЧАТА ----------
     if lower.startswith(".актив"):
-        rows = storage.top_active_users(chat_id, days=7)
+        target_chat = chat_id
+        rows = storage.top_active_users(target_chat, days=7)
         if not rows:
             await event.reply("Данных по активности пока нет (собираются на входящих)")
             return
@@ -1190,7 +1299,10 @@ async def handler(event):
         if not rows:
             await event.reply("Данных пока нет")
             return
-        cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400))
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        cutoff = time.strftime(
+            "%Y-%m-%d", time.gmtime(time.time() - 7 * 86400)
+        )
         silent = [r for r in rows if r["last_day"] < cutoff]
         if not silent:
             await event.reply("Все активны за последнюю неделю 👍")
@@ -1206,6 +1318,7 @@ async def handler(event):
         await event.reply("🔇 **Молчуны**\n\n" + "\n".join(lines))
         return
 
+    # ---------- ИГНОР-ЛИСТ ----------
     if lower.startswith(".игнор"):
         arg = text.split(maxsplit=1)
         target = int(arg[1]) if len(arg) > 1 and arg[1].lstrip("-").isdigit() else chat_id
@@ -1220,6 +1333,7 @@ async def handler(event):
         await event.reply("🔔 Убрал из игнора" if ok else "Этого чата не было в игноре")
         return
 
+    # ---------- ПРИВАТНОСТЬ / НЕ ЛОГИРОВАТЬ ----------
     if lower == ".не_логируй":
         currently = storage.is_no_log(chat_id)
         storage.set_no_log(chat_id, not currently)
@@ -1229,6 +1343,7 @@ async def handler(event):
             await event.reply("🔒 Этот чат больше не логируется (антиудаление/индексация выключены)")
         return
 
+    # ---------- RSS ----------
     if lower.startswith(".rss_добавь"):
         url = text.split(maxsplit=1)
         if len(url) < 2 or not url[1].strip().startswith("http"):
@@ -1255,6 +1370,7 @@ async def handler(event):
         await event.reply("📡 **RSS-ленты**\n\n" + "\n".join(f["url"] for f in feeds))
         return
 
+    # ---------- БЭКАП ----------
     if lower == ".бэкап":
         if os.path.exists(storage.DB_PATH):
             await event.reply(file=storage.DB_PATH, message="🗄 Ручной бэкап БД")
@@ -1315,6 +1431,7 @@ async def handler(event):
         )
         return
 
+    # продолжение только если ответ на сообщение ИИ
     if event.is_reply and not lower.startswith("."):
         replied = await event.get_reply_message()
         if replied and replied.id in ai_reply_ids:
@@ -1324,10 +1441,12 @@ async def handler(event):
 
 @bot.on(events.NewMessage(chats="Telegram"))
 async def _login_notice(event):
+    """Официальный аккаунт Telegram шлёт сюда уведомления о новых входах —
+    дублируем себе с пометкой, чтобы не потерялось среди других чатов."""
     try:
         text = event.raw_text or ""
         if any(kw in text.lower() for kw in ("new sign", "новый вход", "log in", "вход в аккаунт")):
-            await bot.send_message("me", f"🔐 **Внимание: возможен новый вход в аккаунт**\n\n{text}")
+            await _log(f"🔐 **Внимание: возможен новый вход в аккаунт**\n\n{text}", level=0)
     except Exception as e:
         print(f"[login_notice] ошибка: {e}")
 
@@ -1336,13 +1455,18 @@ async def main():
     await bot.start()
     me = await bot.get_me()
     print(f"POMA запущена: {me.first_name} (@{me.username})")
+
+    log_chat = await ensure_log_chat()
+    log_name = getattr(log_chat, "title", "POMA Logs")
+    print(f"Группа для логов: «{log_name}» (id: {LOG_CHAT_ID})")
     print("Команды: .помощь")
 
+    # фоновые задачи (шлют в группу логов, а не в Избранное)
     asyncio.create_task(background.reminders_loop(bot))
-    asyncio.create_task(background.daily_digest_loop(bot, build_digest))
-    asyncio.create_task(background.rss_loop(bot))
-    asyncio.create_task(background.backup_loop(bot))
-    asyncio.create_task(background.healthcheck_loop(bot))
+    asyncio.create_task(background.daily_digest_loop(bot, build_digest, LOG_CHAT_ID))
+    asyncio.create_task(background.rss_loop(bot, LOG_CHAT_ID))
+    asyncio.create_task(background.backup_loop(bot, LOG_CHAT_ID))
+    asyncio.create_task(background.healthcheck_loop(bot, LOG_CHAT_ID))
 
     await bot.run_until_disconnected()
 
