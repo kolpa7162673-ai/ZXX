@@ -1,11 +1,18 @@
 import os
+import re
+import time
 import random
 import asyncio
 import aiohttp
+import dateparser
 from openai import OpenAI
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageService
 from dotenv import load_dotenv
+
+import storage
+import background
 
 load_dotenv()
 
@@ -24,9 +31,18 @@ if SESSION:
 else:
     bot = TelegramClient("my_userbot", API_ID, API_HASH)
 
+storage.init_db()
+
 conversations = {}
 MAX_HISTORY = 12
 ai_reply_ids = set()
+
+AFK_MODE = storage.get_setting("afk_enabled", "0") == "1"
+AFK_TEXT = storage.get_setting("afk_text", "Сейчас недоступен, отвечу позже.")
+_afk_recent_replies = {}
+_edit_throttle_lock = asyncio.Semaphore(3)
+SAVES_DIR = "saved_media"
+os.makedirs(SAVES_DIR, exist_ok=True)
 
 
 # ===================== ИИ =====================
@@ -41,22 +57,27 @@ async def ask_ai(prompt: str, chat_id: int = None, system: str = None) -> str:
         messages.extend(conversations[chat_id])
     messages.append({"role": "user", "content": prompt})
 
-    try:
-        response = client_ai.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=messages,
-            max_tokens=1200
-        )
-        answer = response.choices[0].message.content
-        if chat_id is not None:
-            history = conversations.setdefault(chat_id, [])
-            history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": answer})
-            if len(history) > MAX_HISTORY:
-                conversations[chat_id] = history[-MAX_HISTORY:]
-        return answer
-    except Exception as e:
-        return f"Ошибка ИИ: {e}"
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = client_ai.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=messages,
+                max_tokens=1200
+            )
+            answer = response.choices[0].message.content
+            if chat_id is not None:
+                history = conversations.setdefault(chat_id, [])
+                history.append({"role": "user", "content": prompt})
+                history.append({"role": "assistant", "content": answer})
+                if len(history) > MAX_HISTORY:
+                    conversations[chat_id] = history[-MAX_HISTORY:]
+            return answer
+        except Exception as e:
+            last_err = e
+            print(f"[ask_ai] попытка {attempt + 1} не удалась: {e}")
+            await asyncio.sleep(1.5 * (2 ** attempt))
+    return f"Ошибка ИИ после нескольких попыток: {last_err}"
 
 
 def track_ai_msg(msg):
@@ -88,7 +109,6 @@ async def thinking_animation(event):
 
 
 async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: float = 0.06):
-    """Дописывает текст в уже существующее сообщение (эффект печати)."""
     full_text = full_text or ""
     if not full_text.strip():
         try:
@@ -98,7 +118,6 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
         track_ai_msg(msg)
         return msg
 
-    # короткое — сразу
     if len(full_text) <= 60:
         try:
             await msg.edit(full_text)
@@ -107,7 +126,6 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
         track_ai_msg(msg)
         return msg
 
-    # для кода — чуть крупнее куски (быстрее и меньше flood)
     if "```" in full_text or "def " in full_text or "function " in full_text:
         chunk_size = max(chunk_size, 48)
         delay = min(delay, 0.05)
@@ -118,7 +136,8 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
         current = full_text[:pos]
         suffix = " ▌" if pos < len(full_text) else ""
         try:
-            await msg.edit(current + suffix)
+            async with _edit_throttle_lock:
+                await msg.edit(current + suffix)
             await asyncio.sleep(delay)
         except Exception:
             break
@@ -133,11 +152,6 @@ async def type_into_message(msg, full_text: str, chunk_size: int = 32, delay: fl
 
 
 async def ask_ai_animated(event, prompt: str, chat_id: int = None, system: str = None, typewriter: bool = True):
-    """
-    1) анимация прогресса
-    2) запрос к ИИ
-    3) печать ответа в то же сообщение
-    """
     msg = await thinking_animation(event)
     answer = await ask_ai(prompt, chat_id=chat_id, system=system)
 
@@ -166,6 +180,30 @@ async def get_prompt(event, prefix: str) -> str:
     return after
 
 
+async def build_digest() -> str:
+    since = int(time.time()) - 86400
+    events_ = storage.pull_digest_events(since)
+    parts = []
+
+    if events_:
+        lines = []
+        for ev in events_[:15]:
+            lines.append(f"• [{ev['tag']}] {ev['text'][:120]}")
+        parts.append("🔔 **События за 24 часа**\n" + "\n".join(lines))
+
+    tasks = storage.list_tasks()
+    if tasks:
+        parts.append(f"✅ Открытых задач: {len(tasks)}")
+
+    rems = storage.list_pending_reminders()
+    if rems:
+        parts.append(f"⏰ Активных напоминаний: {len(rems)}")
+
+    if not parts:
+        return ""
+    return "📊 **Дайджест дня**\n\n" + "\n\n".join(parts)
+
+
 async def send_animal(event, api_url: str, ok_caption: str, fail_text: str):
     try:
         async with aiohttp.ClientSession() as session:
@@ -182,6 +220,135 @@ async def send_animal(event, api_url: str, ok_caption: str, fail_text: str):
         await event.reply(fail_text)
 
 
+# ===================== АНТИУДАЛЕНИЕ / АНТИРЕДАКТИРОВАНИЕ =====================
+
+@bot.on(events.NewMessage())
+async def _track_for_antidelete(event):
+    try:
+        if storage.is_no_log(event.chat_id):
+            return
+        text = event.raw_text or ""
+        has_media = bool(event.message.media)
+        storage.track_message(event.id, event.chat_id, event.sender_id, text, has_media)
+    except Exception:
+        pass
+
+
+@bot.on(events.MessageEdited())
+async def _on_edit(event):
+    try:
+        if storage.is_no_log(event.chat_id):
+            return
+        old = storage.get_tracked_message(event.id, event.chat_id)
+        new_text = event.raw_text or ""
+        if old and old["text"] and old["text"] != new_text:
+            chat = await event.get_chat()
+            chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", "чат")
+            await bot.send_message(
+                "me",
+                f"✏️ **Сообщение отредактировано** в «{chat_name}»\n\n"
+                f"Было:\n{old['text']}\n\nСтало:\n{new_text}",
+            )
+        storage.track_message(event.id, event.chat_id, event.sender_id, new_text, bool(event.message.media))
+    except Exception as e:
+        print(f"[antiedit] ошибка: {e}")
+
+
+@bot.on(events.MessageDeleted())
+async def _on_delete(event):
+    try:
+        for msg_id in event.deleted_ids:
+            chat_id = event.chat_id
+            if chat_id is None or storage.is_no_log(chat_id):
+                continue
+            old = storage.get_tracked_message(msg_id, chat_id)
+            if old and (old["text"] or old["has_media"]):
+                try:
+                    chat = await bot.get_entity(chat_id)
+                    chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", "чат")
+                except Exception:
+                    chat_name = str(chat_id)
+                body = old["text"] or "(медиа без текста)"
+                await bot.send_message(
+                    "me", f"🗑 **Сообщение удалено** в «{chat_name}»\n\n{body}"
+                )
+    except Exception as e:
+        print(f"[antidelete] ошибка: {e}")
+
+
+# ===================== ВХОДЯЩИЕ: АФК / МОНИТОРИНГ / АКТИВНОСТЬ =====================
+
+@bot.on(events.NewMessage(incoming=True))
+async def _incoming_handler(event):
+    global AFK_MODE, AFK_TEXT
+    try:
+        chat_id = event.chat_id
+        sender_id = event.sender_id
+        text = event.raw_text or ""
+
+        ignored = storage.is_ignored(chat_id)
+        important = False
+        if ignored:
+            if ignored["ai_exception"] and text:
+                check = await ask_ai(
+                    f"Ответь ТОЛЬКО 'да' или 'нет'. Это сообщение реально важное/срочное "
+                    f"(упоминание имени, просьба о помощи, что-то критичное)?\n\n{text}",
+                    chat_id=None,
+                )
+                important = "да" in (check or "").lower()[:10]
+            if not important:
+                return
+
+        if event.is_group or event.is_channel:
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            storage.bump_activity(chat_id, sender_id, day)
+
+        if text:
+            watches = storage.list_watches()
+            lower_text = text.lower()
+            for kw in watches:
+                if kw in lower_text:
+                    storage.add_digest_event(chat_id, sender_id, text, tag="keyword")
+                    try:
+                        chat = await event.get_chat()
+                        chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", "чат")
+                    except Exception:
+                        chat_name = str(chat_id)
+                    await bot.send_message(
+                        "me", f"🔔 Слово «{kw}» упомянуто в «{chat_name}»:\n{text}"
+                    )
+                    break
+
+        if AFK_MODE and event.is_private and not event.out:
+            last = _afk_recent_replies.get(sender_id, 0)
+            if time.time() - last < 600:
+                return
+            urgency = "не срочно"
+            if text:
+                verdict = await ask_ai(
+                    f"Ответь ОДНИМ словом: 'срочно' или 'обычно'. Оцени срочность сообщения "
+                    f"для человека, который сейчас недоступен:\n\n{text}",
+                    chat_id=None,
+                )
+                if verdict and "срочно" in verdict.lower():
+                    urgency = "срочно"
+            reply_text = AFK_TEXT
+            if urgency == "срочно":
+                reply_text += "\n\n(это сообщение помечено как срочное — я отдельно уведомлён)"
+                try:
+                    sender = await event.get_sender()
+                    name = getattr(sender, "first_name", "Кто-то")
+                except Exception:
+                    name = "Кто-то"
+                await bot.send_message(
+                    "me", f"⚡ Похоже на срочное сообщение от {name}:\n{text}"
+                )
+            await event.reply(reply_text)
+            _afk_recent_replies[sender_id] = time.time()
+    except Exception as e:
+        print(f"[incoming_handler] ошибка: {e}")
+
+
 # ===================== HANDLER =====================
 
 @bot.on(events.NewMessage(outgoing=True))
@@ -193,7 +360,6 @@ async def handler(event):
     lower = text.lower()
     chat_id = event.chat_id
 
-    # ---------- ОСНОВНОЕ ----------
     if lower.startswith(".расскажи"):
         prompt = await get_prompt(event, ".расскажи") or "Расскажи что-нибудь интересное и короткое"
         await ask_ai_animated(event, prompt, chat_id=chat_id)
@@ -257,7 +423,6 @@ async def handler(event):
         )
         return
 
-    # ---------- СТИЛЬ / КОНТЕНТ ----------
     if lower.startswith(".роль"):
         rest = text[5:].strip()
         if not rest:
@@ -443,7 +608,6 @@ async def handler(event):
         )
         return
 
-    # ---------- УЧЁБА / РАБОТА ----------
     if lower.startswith(".todo"):
         prompt = await get_prompt(event, ".todo")
         if not prompt:
@@ -497,7 +661,6 @@ async def handler(event):
         )
         return
 
-    # ---------- КОД ----------
     if lower.startswith(".bug") or lower.startswith(".ошибка"):
         pref = ".bug" if lower.startswith(".bug") else ".ошибка"
         prompt = await get_prompt(event, pref)
@@ -580,7 +743,6 @@ async def handler(event):
         )
         return
 
-    # ---------- NFT / WEB3 ----------
     if lower.startswith(".nft"):
         topic = await get_prompt(event, ".nft") or "идея NFT-коллекции"
         await ask_ai_animated(
@@ -642,7 +804,6 @@ async def handler(event):
         )
         return
 
-    # ---------- УТИЛИТЫ ----------
     if lower.startswith(".рандом") or lower.startswith(".random"):
         rest = text.split(maxsplit=1)
         if len(rest) < 2 or "-" not in rest[1]:
@@ -724,6 +885,383 @@ async def handler(event):
         await event.reply("Память диалога очищена 🧹")
         return
 
+    if lower.startswith(".распознай"):
+        if not event.is_reply:
+            await event.reply("Ответь этой командой на голосовое/аудио сообщение")
+            return
+        replied = await event.get_reply_message()
+        if not replied or not replied.media:
+            await event.reply("В отвеченном сообщении нет аудио")
+            return
+        status = await event.reply("🎙 Распознаю...")
+        try:
+            path = await replied.download_media(file="voice_tmp")
+            with open(path, "rb") as f:
+                transcript = client_ai.audio.transcriptions.create(
+                    model="whisper-large-v3",
+                    file=f,
+                )
+            os.remove(path)
+            await status.edit(f"📝 Расшифровка:\n\n{transcript.text}")
+        except Exception as e:
+            await status.edit(f"Не удалось распознать: {e}")
+        return
+
+    if lower.startswith(".афк"):
+        global AFK_MODE, AFK_TEXT
+        rest = text[4:].strip()
+        if rest.startswith("вкл"):
+            AFK_MODE = True
+            custom = rest[3:].strip()
+            if custom:
+                AFK_TEXT = custom
+            storage.set_setting("afk_enabled", "1")
+            storage.set_setting("afk_text", AFK_TEXT)
+            await event.reply(f"🌙 АФК включён. Текст автоответа:\n{AFK_TEXT}")
+        elif rest.startswith("выкл"):
+            AFK_MODE = False
+            storage.set_setting("afk_enabled", "0")
+            await event.reply("☀️ АФК выключен")
+        else:
+            await event.reply("Использование: `.афк вкл [текст]` или `.афк выкл`")
+        return
+
+    if lower.startswith(".заметка"):
+        note_text = await get_prompt(event, ".заметка")
+        if not note_text:
+            await event.reply("`.заметка текст`")
+            return
+        nid = storage.add_note(note_text)
+        await event.reply(f"📌 Заметка #{nid} сохранена")
+        return
+
+    if lower == ".заметки":
+        notes = storage.list_notes()
+        if not notes:
+            await event.reply("Заметок пока нет")
+            return
+        lines = [f"#{n['id']}: {n['text']}" for n in notes]
+        await event.reply("📋 **Заметки**\n\n" + "\n".join(lines))
+        return
+
+    if lower.startswith(".удали_заметку"):
+        arg = text.split(maxsplit=1)
+        if len(arg) < 2 or not arg[1].strip().isdigit():
+            await event.reply("`.удали_заметку id`")
+            return
+        ok = storage.delete_note(int(arg[1].strip()))
+        await event.reply("Удалено ✅" if ok else "Заметка с таким id не найдена")
+        return
+
+    if lower.startswith(".задача"):
+        task_text = await get_prompt(event, ".задача")
+        if not task_text:
+            await event.reply("`.задача текст`")
+            return
+        tid = storage.add_task(task_text)
+        await event.reply(f"✅ Задача #{tid} добавлена")
+        return
+
+    if lower == ".задачи":
+        tasks = storage.list_tasks()
+        if not tasks:
+            await event.reply("Активных задач нет 🎉")
+            return
+        lines = [f"#{t['id']}: {t['text']}" for t in tasks]
+        await event.reply("📋 **Задачи**\n\n" + "\n".join(lines))
+        return
+
+    if lower.startswith(".готово"):
+        arg = text.split(maxsplit=1)
+        if len(arg) < 2 or not arg[1].strip().isdigit():
+            await event.reply("`.готово id`")
+            return
+        ok = storage.complete_task(int(arg[1].strip()))
+        await event.reply("Готово ✅" if ok else "Задача с таким id не найдена")
+        return
+
+    if lower.startswith(".контакт "):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[1].startswith("@"):
+            await event.reply("`.контакт @username заметка`")
+            return
+        username, note = parts[1].lstrip("@"), parts[2]
+        storage.upsert_contact(username, note)
+        await event.reply(f"👤 Заметка о @{username} сохранена")
+        return
+
+    if lower.startswith(".контакт_инфо"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].startswith("@"):
+            await event.reply("`.контакт_инфо @username`")
+            return
+        username = parts[1].lstrip("@")
+        c = storage.get_contact(username)
+        if not c:
+            await event.reply("По этому контакту записей нет")
+            return
+        await event.reply(f"👤 **@{username}**\n\n{c['note']}")
+        return
+
+    if lower == ".контакты":
+        contacts = storage.list_contacts()
+        if not contacts:
+            await event.reply("Контактов пока нет")
+            return
+        lines = [f"@{c['username']}" for c in contacts]
+        await event.reply("📇 **Контакты**\n\n" + "\n".join(lines))
+        return
+
+    if lower.startswith(".напомни"):
+        rest = text[8:].strip()
+        parsed_dt = None
+        remind_text = rest
+        for cut in range(len(rest), 0, -1):
+            candidate = rest[:cut]
+            dt = dateparser.parse(
+                candidate,
+                languages=["ru"],
+                settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False},
+            )
+            if dt:
+                parsed_dt = dt
+                remind_text = rest[cut:].strip() or "напоминание"
+                break
+        if not parsed_dt:
+            await event.reply(
+                "Не понял время. Примеры:\n"
+                "`.напомни через 2 часа купить хлеб`\n"
+                "`.напомни завтра в 9 позвонить`"
+            )
+            return
+        remind_ts = int(parsed_dt.timestamp())
+        rid = storage.add_reminder(chat_id, remind_text, remind_ts)
+        await event.reply(
+            f"⏰ Напоминание #{rid} поставлено на {parsed_dt.strftime('%d.%m %H:%M')}"
+        )
+        return
+
+    if lower == ".напоминания":
+        rems = storage.list_pending_reminders()
+        if not rems:
+            await event.reply("Напоминаний нет")
+            return
+        lines = [
+            f"#{r['id']}: {r['text']} — {time.strftime('%d.%m %H:%M', time.localtime(r['remind_at']))}"
+            for r in rems
+        ]
+        await event.reply("⏰ **Напоминания**\n\n" + "\n".join(lines))
+        return
+
+    if lower.startswith(".отмени_напоминание"):
+        arg = text.split(maxsplit=1)
+        if len(arg) < 2 or not arg[1].strip().isdigit():
+            await event.reply("`.отмени_напоминание id`")
+            return
+        ok = storage.cancel_reminder(int(arg[1].strip()))
+        await event.reply("Отменено ✅" if ok else "Не найдено")
+        return
+
+    if lower == ".сохрани":
+        if not event.is_reply:
+            await event.reply("Ответь этой командой на фото/видео/документ")
+            return
+        replied = await event.get_reply_message()
+        if not replied or not replied.media:
+            await event.reply("В отвеченном сообщении нет медиа")
+            return
+        try:
+            path = await replied.download_media(file=SAVES_DIR + "/")
+            await event.reply(f"💾 Сохранено: `{path}`")
+        except Exception as e:
+            await event.reply(f"Не удалось сохранить: {e}")
+        return
+
+    if lower.startswith(".суммаризируй"):
+        url = text.split(maxsplit=1)
+        if len(url) < 2 or not url[1].strip().startswith("http"):
+            await event.reply("`.суммаризируй ссылка`")
+            return
+        target_url = url[1].strip()
+        status = await event.reply("🌐 Загружаю страницу...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(target_url, timeout=15) as resp:
+                    html = await resp.text()
+            text_only = re.sub("<[^<]+?>", " ", html)
+            text_only = re.sub(r"\s+", " ", text_only).strip()[:6000]
+            await status.edit("🤖 Делаю пересказ...")
+            answer = await ask_ai(
+                f"Кратко перескажи содержание страницы (5-7 предложений):\n\n{text_only}",
+                chat_id=chat_id,
+            )
+            await status.edit(answer)
+        except Exception as e:
+            await status.edit(f"Не удалось обработать ссылку: {e}")
+        return
+
+    if lower.startswith(".следи"):
+        kw = text[6:].strip()
+        if not kw:
+            await event.reply("`.следи слово`")
+            return
+        storage.add_watch(kw)
+        await event.reply(f"👁 Слежу за словом «{kw}» во всех чатах")
+        return
+
+    if lower.startswith(".не_следи"):
+        kw = text[9:].strip()
+        if not kw:
+            await event.reply("`.не_следи слово`")
+            return
+        ok = storage.remove_watch(kw)
+        await event.reply("Убрал из слежки ✅" if ok else "Такого слова не было в списке")
+        return
+
+    if lower == ".слежка":
+        watches = storage.list_watches()
+        if not watches:
+            await event.reply("Список слежки пуст")
+            return
+        await event.reply("👁 **Слежка за словами**\n\n" + ", ".join(watches))
+        return
+
+    if lower == ".сводка":
+        status = await event.reply("📊 Собираю сводку...")
+        digest_text = await build_digest()
+        await status.edit(digest_text or "За последнее время значимых событий не было")
+        return
+
+    if lower.startswith(".отложи"):
+        rest = text[7:].strip()
+        tokens = rest.split()
+        parsed_dt = None
+        target_str = None
+        body = None
+        for i in range(1, len(tokens)):
+            maybe_time = " ".join(tokens[:i])
+            dt = dateparser.parse(
+                maybe_time, languages=["ru"],
+                settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False},
+            )
+            if dt and i < len(tokens) and tokens[i].startswith("@"):
+                parsed_dt = dt
+                target_str = tokens[i]
+                body = " ".join(tokens[i + 1:])
+                break
+        if not parsed_dt or not target_str or not body:
+            await event.reply(
+                "Не разобрал формат. Пример:\n`.отложи через 1 час @friend Привет!`"
+            )
+            return
+        delay = max(0, parsed_dt.timestamp() - time.time())
+
+        async def _send_later(delay_s, target_username, message):
+            await asyncio.sleep(delay_s)
+            try:
+                await bot.send_message(target_username, message)
+            except Exception as e:
+                print(f"[отложи] не удалось отправить: {e}")
+
+        asyncio.create_task(_send_later(delay, target_str, body))
+        await event.reply(
+            f"📤 Отправлю «{body}» пользователю {target_str} в {parsed_dt.strftime('%d.%m %H:%M')}"
+        )
+        return
+
+    if lower.startswith(".актив"):
+        rows = storage.top_active_users(chat_id, days=7)
+        if not rows:
+            await event.reply("Данных по активности пока нет (собираются на входящих)")
+            return
+        lines = []
+        for r in rows:
+            try:
+                u = await bot.get_entity(r["user_id"])
+                name = getattr(u, "first_name", str(r["user_id"]))
+            except Exception:
+                name = str(r["user_id"])
+            lines.append(f"{name}: {r['total']} сообщ.")
+        await event.reply("📊 **Активность за 7 дней**\n\n" + "\n".join(lines))
+        return
+
+    if lower.startswith(".молчуны"):
+        rows = storage.last_seen_per_user(chat_id)
+        if not rows:
+            await event.reply("Данных пока нет")
+            return
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400))
+        silent = [r for r in rows if r["last_day"] < cutoff]
+        if not silent:
+            await event.reply("Все активны за последнюю неделю 👍")
+            return
+        lines = []
+        for r in silent:
+            try:
+                u = await bot.get_entity(r["user_id"])
+                name = getattr(u, "first_name", str(r["user_id"]))
+            except Exception:
+                name = str(r["user_id"])
+            lines.append(f"{name}: последний раз {r['last_day']}")
+        await event.reply("🔇 **Молчуны**\n\n" + "\n".join(lines))
+        return
+
+    if lower.startswith(".игнор"):
+        arg = text.split(maxsplit=1)
+        target = int(arg[1]) if len(arg) > 1 and arg[1].lstrip("-").isdigit() else chat_id
+        storage.add_ignore(target, ai_exception=True)
+        await event.reply(f"🔕 Чат {target} добавлен в игнор (с ИИ-исключением на важное)")
+        return
+
+    if lower.startswith(".не_игнор"):
+        arg = text.split(maxsplit=1)
+        target = int(arg[1]) if len(arg) > 1 and arg[1].lstrip("-").isdigit() else chat_id
+        ok = storage.remove_ignore(target)
+        await event.reply("🔔 Убрал из игнора" if ok else "Этого чата не было в игноре")
+        return
+
+    if lower == ".не_логируй":
+        currently = storage.is_no_log(chat_id)
+        storage.set_no_log(chat_id, not currently)
+        if currently:
+            await event.reply("📝 Логирование этого чата включено обратно")
+        else:
+            await event.reply("🔒 Этот чат больше не логируется (антиудаление/индексация выключены)")
+        return
+
+    if lower.startswith(".rss_добавь"):
+        url = text.split(maxsplit=1)
+        if len(url) < 2 or not url[1].strip().startswith("http"):
+            await event.reply("`.rss_добавь ссылка`")
+            return
+        storage.add_feed(url[1].strip())
+        await event.reply("📡 RSS-лента добавлена")
+        return
+
+    if lower.startswith(".rss_удали"):
+        url = text.split(maxsplit=1)
+        if len(url) < 2:
+            await event.reply("`.rss_удали ссылка`")
+            return
+        ok = storage.remove_feed(url[1].strip())
+        await event.reply("Удалено ✅" if ok else "Такой ленты не было")
+        return
+
+    if lower == ".rss_список":
+        feeds = storage.list_feeds()
+        if not feeds:
+            await event.reply("Лент пока нет")
+            return
+        await event.reply("📡 **RSS-ленты**\n\n" + "\n".join(f["url"] for f in feeds))
+        return
+
+    if lower == ".бэкап":
+        if os.path.exists(storage.DB_PATH):
+            await event.reply(file=storage.DB_PATH, message="🗄 Ручной бэкап БД")
+        else:
+            await event.reply("Файл БД пока не создан")
+        return
+
     if lower in (".помощь", ".help", ".команды"):
         await event.reply(
             "✨ **POMA — команды**\n"
@@ -748,13 +1286,35 @@ async def handler(event):
             "`.рандом 1-100` `.выбери a | b | c`\n"
             "`.cat` `.dog` `.info` `.a_troll`\n"
             "`.сброс` — очистить память диалога\n\n"
+            "**🎙 Голос / АФК**\n"
+            "`.распознай` (ответом на войс) `.афк вкл/выкл [текст]`\n\n"
+            "**📝 Заметки и задачи**\n"
+            "`.заметка` `.заметки` `.удали_заметку id`\n"
+            "`.задача` `.задачи` `.готово id`\n\n"
+            "**👤 Контакты**\n"
+            "`.контакт @user заметка` `.контакт_инфо @user` `.контакты`\n\n"
+            "**⏰ Напоминания и отложенная отправка**\n"
+            "`.напомни через 2 часа текст` `.напоминания` `.отмени_напоминание id`\n"
+            "`.отложи через 1 час @user текст`\n\n"
+            "**💾 Медиа и контент**\n"
+            "`.сохрани` (ответом на медиа) `.суммаризируй ссылка`\n\n"
+            "**🔔 Мониторинг**\n"
+            "`.следи слово` `.не_следи слово` `.слежка`\n"
+            "`.сводка` — дайджест по запросу (+ авто раз в день)\n"
+            "`.игнор [chat_id]` `.не_игнор [chat_id]` `.не_логируй`\n\n"
+            "**📡 RSS и бэкап**\n"
+            "`.rss_добавь url` `.rss_список` `.rss_удали url` `.бэкап`\n\n"
+            "**📊 Активность**\n"
+            "`.актив` `.молчуны`\n\n"
+            "**🛡 Автоматически (без команд)**\n"
+            "Антиудаление и антиредактирование — лог в Избранное\n"
+            "Уведомление о новом входе в аккаунт\n\n"
             "**💬 Диалог**\n"
             "Ответь на сообщение бота текстом — продолжит тему.\n"
             "Длинные ответы (код) печатаются в одном сообщении ▌"
         )
         return
 
-    # продолжение только если ответ на сообщение ИИ
     if event.is_reply and not lower.startswith("."):
         replied = await event.get_reply_message()
         if replied and replied.id in ai_reply_ids:
@@ -762,11 +1322,28 @@ async def handler(event):
         return
 
 
+@bot.on(events.NewMessage(chats="Telegram"))
+async def _login_notice(event):
+    try:
+        text = event.raw_text or ""
+        if any(kw in text.lower() for kw in ("new sign", "новый вход", "log in", "вход в аккаунт")):
+            await bot.send_message("me", f"🔐 **Внимание: возможен новый вход в аккаунт**\n\n{text}")
+    except Exception as e:
+        print(f"[login_notice] ошибка: {e}")
+
+
 async def main():
     await bot.start()
     me = await bot.get_me()
     print(f"POMA запущена: {me.first_name} (@{me.username})")
     print("Команды: .помощь")
+
+    asyncio.create_task(background.reminders_loop(bot))
+    asyncio.create_task(background.daily_digest_loop(bot, build_digest))
+    asyncio.create_task(background.rss_loop(bot))
+    asyncio.create_task(background.backup_loop(bot))
+    asyncio.create_task(background.healthcheck_loop(bot))
+
     await bot.run_until_disconnected()
 
 
