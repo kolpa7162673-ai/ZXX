@@ -1,4 +1,4 @@
-фimport os
+import os
 import random
 import asyncio
 import aiohttp
