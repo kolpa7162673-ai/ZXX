@@ -10,6 +10,8 @@ from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageService
 from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import ReactionEmoji
 from dotenv import load_dotenv
 
 import storage
@@ -37,6 +39,24 @@ storage.init_db()
 conversations = {}
 MAX_HISTORY = 12
 ai_reply_ids = set()
+menu_reply_ids = {}  # msg_id -> "main" | номер категории (для навигации по .меню)
+
+MENU_CATEGORIES = {
+    1: ("Основное (ИИ)", "📌", [".расскажи", ".объясни", ".кратко / .tldr", ".факт", ".шутка", ".идея", ".перевод"]),
+    2: ("Код", "💻", [".код", ".bug", ".review / .ревью", ".regex", ".sql", ".тест", ".оптимизация"]),
+    3: ("Стиль и контент", "🎨", [".роль", ".стиль", ".мем", ".цитата", ".хук", ".тред", ".cta", ".био", ".спор", ".разбор / .ору", ".сравни", ".имя", ".план", ".промпт", ".элия"]),
+    4: ("NFT / Web3", "🖼", [".nft", ".коллекция", ".trait", ".roadmap", ".утилита", ".нейминг", ".mint"]),
+    5: ("Учёба и работа", "💼", [".todo (ИИ-чеклист)", ".письмо", ".собес", ".термин", ".конспект"]),
+    6: ("Заметки и задачи", "📝", [".заметка текст", ".заметки", ".удали_заметку id", ".задача текст", ".задачи", ".готово id"]),
+    7: ("Контакты (CRM)", "👤", [".контакт @user заметка", ".контакт_инфо @user", ".контакты"]),
+    8: ("Напоминания и отложка", "⏰", [".напомни через 2 часа текст", ".напоминания", ".отмени_напоминание id", ".отложи через 1 час @user текст"]),
+    9: ("Мониторинг и приватность", "🔔", [".следи слово", ".не_следи слово", ".слежка", ".сводка", ".игнор [chat_id]", ".не_игнор [chat_id]", ".не_логируй"]),
+    10: ("RSS и бэкап", "📡", [".rss_добавь url", ".rss_список", ".rss_удали url", ".бэкап"]),
+    11: ("Активность чата", "📊", [".актив", ".молчуны"]),
+    12: ("Голос и АФК", "🎙", [".распознай (ответом на войс)", ".афк вкл [текст]", ".афк выкл"]),
+    13: ("Утилиты", "🎲", [".рандом 1-100", ".выбери a | b | c", ".cat", ".dog", ".info", ".a_troll", ".сброс", ".реакции (рандомные реакции в чате)"]),
+    14: ("Сохранение и ссылки", "💾", [".сохрани (ответом на медиа)", ".суммаризируй ссылка"]),
+}
 
 # ---------------- runtime state (не персистентное, живёт в памяти процесса) ----------------
 AFK_MODE = storage.get_setting("afk_enabled", "0") == "1"
@@ -45,6 +65,37 @@ _afk_recent_replies = {}  # user_id -> timestamp последнего автоо
 _edit_throttle_lock = asyncio.Semaphore(3)  # ограничение параллельных msg.edit() (антифлуд-бан)
 SAVES_DIR = "saved_media"
 os.makedirs(SAVES_DIR, exist_ok=True)
+
+RANDOM_REACTION_EMOJIS = ["👍", "🔥", "❤️", "😁", "🎉", "🤔", "👏", "😱", "🤯", "💯", "🥰", "😍"]
+RANDOM_REACTION_CHANCE = 1 / 30  # в среднем 1 реакция на 30 сообщений
+
+
+async def send_reaction(chat, msg_id: int, emoji: str):
+    """Ставит реакцию-эмодзи на сообщение. Работает и для своих сообщений
+    (подтверждение команды), и для чужих (рандомные реакции в чате)."""
+    try:
+        await bot(SendReactionRequest(
+            peer=chat,
+            msg_id=msg_id,
+            reaction=[ReactionEmoji(emoticon=emoji)],
+        ))
+    except Exception as e:
+        print(f"[reaction] не удалось поставить реакцию: {e}")
+
+
+async def react_ok(event):
+    await send_reaction(event.chat_id, event.id, "✅")
+
+
+async def react_fail(event):
+    await send_reaction(event.chat_id, event.id, "❌")
+
+
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    if total == 0:
+        return "▱" * width + " 0/0"
+    filled = round(width * done / total)
+    return "▰" * filled + "▱" * (width - filled) + f" {done}/{total}"
 
 # ---------------- лог-группа (создаётся автоматически) ----------------
 LOG_LEVEL = int(os.getenv("LOG_LEVEL", "1"))  # 0 = не логировать вообще
@@ -84,6 +135,13 @@ async def ask_ai(prompt: str, chat_id: int = None, system: str = None) -> str:
             print(f"[ask_ai] попытка {attempt + 1} не удалась: {e}")
             await asyncio.sleep(1.5 * (2 ** attempt))
     return f"Ошибка ИИ после нескольких попыток: {last_err}"
+
+
+def track_menu_msg(msg_id, value):
+    menu_reply_ids[msg_id] = value
+    if len(menu_reply_ids) > 300:
+        for k in list(menu_reply_ids.keys())[:-200]:
+            menu_reply_ids.pop(k, None)
 
 
 def track_ai_msg(msg):
@@ -194,30 +252,48 @@ async def get_prompt(event, prefix: str) -> str:
     return after
 
 
+# ---------------- красивое оформление списков ----------------
+_SEP = "┄" * 18
+
+
+def fmt_panel(title: str, emoji: str, lines: list, footer: str = None, empty_text: str = "Пока пусто") -> str:
+    """Единый стиль для всех списков: заголовок, разделитель, пункты, подвал.
+    Если lines пуст — аккуратное сообщение вместо голого текста."""
+    if not lines:
+        return f"{emoji} **{title}**\n{_SEP}\n_{empty_text}_"
+    body = "\n".join(lines)
+    out = f"{emoji} **{title}**\n{_SEP}\n{body}"
+    if footer:
+        out += f"\n{_SEP}\n· _{footer}_"
+    return out
+
+
+def fmt_id(n) -> str:
+    """Номер записи в моноширинном виде — визуально отделяет id от текста."""
+    return f"`#{n}`"
+
+
 async def build_digest() -> str:
     """Собирает дайджест: события слежки за ключевыми словами за последние 24 часа
     + список активных напоминаний + количество открытых задач."""
     since = int(time.time()) - 86400
     events_ = storage.pull_digest_events(since)
-    parts = []
+    lines = []
 
-    if events_:
-        lines = []
-        for ev in events_[:15]:
-            lines.append(f"• [{ev['tag']}] {ev['text'][:120]}")
-        parts.append("🔔 **События за 24 часа**\n" + "\n".join(lines))
+    for ev in events_[:15]:
+        lines.append(f"🔔 [{ev['tag']}] {ev['text'][:120]}")
 
     tasks = storage.list_tasks()
     if tasks:
-        parts.append(f"✅ Открытых задач: {len(tasks)}")
+        lines.append(f"✅ Открытых задач: `{len(tasks)}`")
 
     rems = storage.list_pending_reminders()
     if rems:
-        parts.append(f"⏰ Активных напоминаний: {len(rems)}")
+        lines.append(f"⏰ Активных напоминаний: `{len(rems)}`")
 
-    if not parts:
+    if not lines:
         return ""
-    return "📊 **Дайджест дня**\n\n" + "\n\n".join(parts)
+    return fmt_panel("ДАЙДЖЕСТ ДНЯ", "📊", lines)
 
 
 async def ensure_log_chat():
@@ -401,6 +477,11 @@ async def _incoming_handler(event):
                         chat_name = str(chat_id)
                     await _log(f"🔔 Слово «{kw}» упомянуто в «{chat_name}»:\n{text}", level=1)
                     break
+
+        # рандомные реакции (если включены командой .реакции для этого чата)
+        if storage.is_random_reactions(chat_id) and random.random() < RANDOM_REACTION_CHANCE:
+            emoji = random.choice(RANDOM_REACTION_EMOJIS)
+            await send_reaction(chat_id, event.id, emoji)
 
         # АФК-автоответчик
         if AFK_MODE and event.is_private and not event.out:
@@ -1023,16 +1104,15 @@ async def handler(event):
             await event.reply("`.заметка текст`")
             return
         nid = storage.add_note(note_text)
-        await event.reply(f"📌 Заметка #{nid} сохранена")
+        await event.reply(f"✅ Заметка {fmt_id(nid)} сохранена")
         return
 
     if lower == ".заметки":
         notes = storage.list_notes()
-        if not notes:
-            await event.reply("Заметок пока нет")
-            return
-        lines = [f"#{n['id']}: {n['text']}" for n in notes]
-        await event.reply("📋 **Заметки**\n\n" + "\n".join(lines))
+        lines = [f"📌 {fmt_id(n['id'])}  {n['text']}" for n in notes]
+        await event.reply(
+            fmt_panel("ЗАМЕТКИ", "🗒", lines, footer=f"всего: {len(notes)}", empty_text="Заметок пока нет")
+        )
         return
 
     if lower.startswith(".удали_заметку"):
@@ -1041,7 +1121,11 @@ async def handler(event):
             await event.reply("`.удали_заметку id`")
             return
         ok = storage.delete_note(int(arg[1].strip()))
-        await event.reply("Удалено ✅" if ok else "Заметка с таким id не найдена")
+        if ok:
+            await react_ok(event)
+        else:
+            await react_fail(event)
+            await event.reply("Заметка с таким id не найдена")
         return
 
     # ---------- ЗАДАЧИ (реальный трекер, отдельно от ИИ-.todo) ----------
@@ -1051,16 +1135,15 @@ async def handler(event):
             await event.reply("`.задача текст`")
             return
         tid = storage.add_task(task_text)
-        await event.reply(f"✅ Задача #{tid} добавлена")
+        await event.reply(f"✅ Задача {fmt_id(tid)} добавлена")
         return
 
     if lower == ".задачи":
         tasks = storage.list_tasks()
-        if not tasks:
-            await event.reply("Активных задач нет 🎉")
-            return
-        lines = [f"#{t['id']}: {t['text']}" for t in tasks]
-        await event.reply("📋 **Задачи**\n\n" + "\n".join(lines))
+        lines = [f"🔲 {fmt_id(t['id'])}  {t['text']}" for t in tasks]
+        await event.reply(
+            fmt_panel("ЗАДАЧИ", "📋", lines, footer=f"открыто: {len(tasks)}", empty_text="Активных задач нет 🎉")
+        )
         return
 
     if lower.startswith(".готово"):
@@ -1069,7 +1152,11 @@ async def handler(event):
             await event.reply("`.готово id`")
             return
         ok = storage.complete_task(int(arg[1].strip()))
-        await event.reply("Готово ✅" if ok else "Задача с таким id не найдена")
+        if ok:
+            await react_ok(event)
+        else:
+            await react_fail(event)
+            await event.reply("Задача с таким id не найдена")
         return
 
     # ---------- КОНТАКТЫ (CRM) ----------
@@ -1093,16 +1180,16 @@ async def handler(event):
         if not c:
             await event.reply("По этому контакту записей нет")
             return
-        await event.reply(f"👤 **@{username}**\n\n{c['note']}")
+        notes_lines = [f"· {line}" for line in c["note"].split("\n") if line.strip()]
+        await event.reply(fmt_panel(f"@{username}", "👤", notes_lines))
         return
 
     if lower == ".контакты":
         contacts = storage.list_contacts()
-        if not contacts:
-            await event.reply("Контактов пока нет")
-            return
-        lines = [f"@{c['username']}" for c in contacts]
-        await event.reply("📇 **Контакты**\n\n" + "\n".join(lines))
+        lines = [f"👤 @{c['username']}" for c in contacts]
+        await event.reply(
+            fmt_panel("КОНТАКТЫ", "📇", lines, footer=f"всего: {len(contacts)}", empty_text="Контактов пока нет")
+        )
         return
 
     # ---------- НАПОМИНАНИЯ ----------
@@ -1138,14 +1225,13 @@ async def handler(event):
 
     if lower == ".напоминания":
         rems = storage.list_pending_reminders()
-        if not rems:
-            await event.reply("Напоминаний нет")
-            return
         lines = [
-            f"#{r['id']}: {r['text']} — {time.strftime('%d.%m %H:%M', time.localtime(r['remind_at']))}"
+            f"⏰ {fmt_id(r['id'])}  {r['text']}  ·  `{time.strftime('%d.%m %H:%M', time.localtime(r['remind_at']))}`"
             for r in rems
         ]
-        await event.reply("⏰ **Напоминания**\n\n" + "\n".join(lines))
+        await event.reply(
+            fmt_panel("НАПОМИНАНИЯ", "⏰", lines, footer=f"активно: {len(rems)}", empty_text="Напоминаний нет")
+        )
         return
 
     if lower.startswith(".отмени_напоминание"):
@@ -1154,7 +1240,11 @@ async def handler(event):
             await event.reply("`.отмени_напоминание id`")
             return
         ok = storage.cancel_reminder(int(arg[1].strip()))
-        await event.reply("Отменено ✅" if ok else "Не найдено")
+        if ok:
+            await react_ok(event)
+        else:
+            await react_fail(event)
+            await event.reply("Не найдено")
         return
 
     # ---------- СОХРАНЕНИЕ МЕДИА ----------
@@ -1218,10 +1308,10 @@ async def handler(event):
 
     if lower == ".слежка":
         watches = storage.list_watches()
-        if not watches:
-            await event.reply("Список слежки пуст")
-            return
-        await event.reply("👁 **Слежка за словами**\n\n" + ", ".join(watches))
+        lines = [f"👁 {w}" for w in watches]
+        await event.reply(
+            fmt_panel("СЛЕЖКА ЗА СЛОВАМИ", "🔔", lines, footer=f"слов: {len(watches)}", empty_text="Список слежки пуст")
+        )
         return
 
     # ---------- ДАЙДЖЕСТ ПО ЗАПРОСУ ----------
@@ -1278,35 +1368,26 @@ async def handler(event):
 
     # ---------- АКТИВНОСТЬ ЧАТА ----------
     if lower.startswith(".актив"):
-        target_chat = chat_id
-        rows = storage.top_active_users(target_chat, days=7)
-        if not rows:
-            await event.reply("Данных по активности пока нет (собираются на входящих)")
-            return
+        rows = storage.top_active_users(chat_id, days=7)
+        medals = ["🥇", "🥈", "🥉"]
         lines = []
-        for r in rows:
+        for i, r in enumerate(rows):
             try:
                 u = await bot.get_entity(r["user_id"])
                 name = getattr(u, "first_name", str(r["user_id"]))
             except Exception:
                 name = str(r["user_id"])
-            lines.append(f"{name}: {r['total']} сообщ.")
-        await event.reply("📊 **Активность за 7 дней**\n\n" + "\n".join(lines))
+            mark = medals[i] if i < 3 else "▫️"
+            lines.append(f"{mark} {name}  ·  `{r['total']}` сообщ.")
+        await event.reply(
+            fmt_panel("АКТИВНОСТЬ ЗА 7 ДНЕЙ", "📊", lines, empty_text="Данных пока нет (собираются на входящих)")
+        )
         return
 
     if lower.startswith(".молчуны"):
         rows = storage.last_seen_per_user(chat_id)
-        if not rows:
-            await event.reply("Данных пока нет")
-            return
-        today = time.strftime("%Y-%m-%d", time.gmtime())
-        cutoff = time.strftime(
-            "%Y-%m-%d", time.gmtime(time.time() - 7 * 86400)
-        )
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400))
         silent = [r for r in rows if r["last_day"] < cutoff]
-        if not silent:
-            await event.reply("Все активны за последнюю неделю 👍")
-            return
         lines = []
         for r in silent:
             try:
@@ -1314,8 +1395,10 @@ async def handler(event):
                 name = getattr(u, "first_name", str(r["user_id"]))
             except Exception:
                 name = str(r["user_id"])
-            lines.append(f"{name}: последний раз {r['last_day']}")
-        await event.reply("🔇 **Молчуны**\n\n" + "\n".join(lines))
+            lines.append(f"🔇 {name}  ·  посл. раз `{r['last_day']}`")
+        await event.reply(
+            fmt_panel("МОЛЧУНЫ", "🔕", lines, empty_text="Все активны за последнюю неделю 👍")
+        )
         return
 
     # ---------- ИГНОР-ЛИСТ ----------
@@ -1364,10 +1447,10 @@ async def handler(event):
 
     if lower == ".rss_список":
         feeds = storage.list_feeds()
-        if not feeds:
-            await event.reply("Лент пока нет")
-            return
-        await event.reply("📡 **RSS-ленты**\n\n" + "\n".join(f["url"] for f in feeds))
+        lines = [f"📡 {f['url']}" for f in feeds]
+        await event.reply(
+            fmt_panel("RSS-ЛЕНТЫ", "📰", lines, footer=f"лент: {len(feeds)}", empty_text="Лент пока нет")
+        )
         return
 
     # ---------- БЭКАП ----------
@@ -1378,10 +1461,63 @@ async def handler(event):
             await event.reply("Файл БД пока не создан")
         return
 
+    # ---------- РАНДОМНЫЕ РЕАКЦИИ В ЧАТЕ ----------
+    if lower == ".реакции":
+        currently = storage.is_random_reactions(chat_id)
+        if currently:
+            storage.disable_random_reactions(chat_id)
+            await event.reply("⭕ Рандомные реакции в этом чате выключены")
+        else:
+            storage.enable_random_reactions(chat_id)
+            await event.reply("🎲 Рандомные реакции включены — буду иногда (примерно раз в 30 сообщений) реагировать эмодзи. Выключить: снова `.реакции`")
+        return
+
+    # ---------- КРАСИВОЕ МЕНЮ ----------
+    if lower in (".меню", ".menu"):
+        rows = []
+        for num, (title, emoji, _) in MENU_CATEGORIES.items():
+            rows.append(f"{emoji}  `{num:>2}`  {title}")
+        menu_text = (
+            "╭──────────────────────╮\n"
+            "│   ✨ **P O M A** ✨   │\n"
+            "╰──────────────────────╯\n\n"
+            + "\n".join(rows) +
+            f"\n{_SEP}\n· ответь номером на это сообщение, чтобы открыть раздел"
+        )
+        sent = await event.reply(menu_text)
+        track_menu_msg(sent.id, "main")
+        return
+
+    if lower == ".дашборд":
+        notes_n = len(storage.list_notes())
+        all_tasks = storage.list_tasks(include_done=True)
+        open_tasks = [t for t in all_tasks if not t["done"]]
+        done_n = len(all_tasks) - len(open_tasks)
+        rems_n = len(storage.list_pending_reminders())
+        watches_n = len(storage.list_watches())
+        feeds_n = len(storage.list_feeds())
+        ignored_n = storage.count_ignored()
+        afk_state = "🌙 включён" if AFK_MODE else "☀️ выключен"
+        reactions_state = "🎲 включены" if storage.is_random_reactions(chat_id) else "⭕ выключены"
+        lines = [
+            f"📝 Заметок: `{notes_n}`",
+            f"📈 Задачи: `{progress_bar(done_n, len(all_tasks))}`",
+            f"⏰ Напоминаний активно: `{rems_n}`",
+            f"👁 Слов в слежке: `{watches_n}`",
+            f"📡 RSS-лент: `{feeds_n}`",
+            f"🔕 Чатов в игноре: `{ignored_n}`",
+            f"🎙 АФК: {afk_state}",
+            f"🎲 Рандом-реакции здесь: {reactions_state}",
+        ]
+        await event.reply(fmt_panel("ДАШБОРД POMA", "📟", lines))
+        return
+
     if lower in (".помощь", ".help", ".команды"):
         await event.reply(
             "✨ **POMA — команды**\n"
             "_(все с точкой)_\n\n"
+            "🧭 `.меню` — красивое меню по разделам (отвечай номером)\n"
+            "📟 `.дашборд` — статистика: заметки, задачи, напоминания\n\n"
             "**📌 Основное**\n"
             "`.расскажи` `.объясни` `.кратко` / `.tldr`\n"
             "`.факт` `.шутка` `.идея` `.перевод`\n\n"
@@ -1401,7 +1537,8 @@ async def handler(event):
             "**🎲 Утилиты**\n"
             "`.рандом 1-100` `.выбери a | b | c`\n"
             "`.cat` `.dog` `.info` `.a_troll`\n"
-            "`.сброс` — очистить память диалога\n\n"
+            "`.сброс` — очистить память диалога\n"
+            "`.реакции` — рандомные реакции в чате вкл/выкл\n\n"
             "**🎙 Голос / АФК**\n"
             "`.распознай` (ответом на войс) `.афк вкл/выкл [текст]`\n\n"
             "**📝 Заметки и задачи**\n"
@@ -1431,9 +1568,20 @@ async def handler(event):
         )
         return
 
-    # продолжение только если ответ на сообщение ИИ
+    # продолжение только если ответ на сообщение ИИ или навигация по .меню
     if event.is_reply and not lower.startswith("."):
         replied = await event.get_reply_message()
+        if replied and replied.id in menu_reply_ids and text.strip().isdigit():
+            num = int(text.strip())
+            category = MENU_CATEGORIES.get(num)
+            if not category:
+                await event.reply(f"Раздела {num} нет. Ответь числом от 1 до {len(MENU_CATEGORIES)}")
+                return
+            title, emoji, commands = category
+            lines = [f"▫️ `{c}`" for c in commands]
+            sent = await event.reply(fmt_panel(title.upper(), emoji, lines))
+            track_menu_msg(sent.id, num)
+            return
         if replied and replied.id in ai_reply_ids:
             await ask_ai_animated(event, text, chat_id=chat_id)
         return
